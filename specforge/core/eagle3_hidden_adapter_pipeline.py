@@ -148,8 +148,8 @@ def _accuracy(
     return _masked_mean(correct, loss_mask)
 
 
-# TEST TIME EAGLE EXP: gated residual adapter starts as exact normal EAGLE and
-# learns small hidden corrections before the draft LM head.
+# TEST TIME EAGLE EXP: gated adapter starts close to normal EAGLE and learns
+# small hidden corrections either before the LM head or before the next draft step.
 class GatedResidualHiddenAdapter(nn.Module):
     def __init__(
         self,
@@ -159,15 +159,21 @@ class GatedResidualHiddenAdapter(nn.Module):
         gate_type: str = "scalar",
         gate_init: float = 0.0,
         dropout: float = 0.0,
+        merge_type: str = "residual",
     ) -> None:
         super().__init__()
         if gate_type not in {"scalar", "channel"}:
             raise ValueError("--hidden-adapter-gate-type must be 'scalar' or 'channel'")
+        if merge_type not in {"residual", "interpolate"}:
+            raise ValueError(
+                "--hidden-adapter-merge-type must be 'residual' or 'interpolate'"
+            )
         self.hidden_size = hidden_size
         self.bottleneck_size = bottleneck_size
         self.gate_type = gate_type
         self.gate_init = gate_init
         self.dropout = dropout
+        self.merge_type = merge_type
 
         self.input_norm = nn.LayerNorm(hidden_size)
         if bottleneck_size is None or bottleneck_size <= 0:
@@ -181,7 +187,12 @@ class GatedResidualHiddenAdapter(nn.Module):
             )
 
         gate_shape = (hidden_size,) if gate_type == "channel" else (1,)
-        self.gate = nn.Parameter(torch.full(gate_shape, float(gate_init)))
+        if merge_type == "interpolate":
+            gate_init = min(max(float(gate_init), 1e-6), 1 - 1e-6)
+            gate_value = torch.full(gate_shape, gate_init).logit()
+        else:
+            gate_value = torch.full(gate_shape, float(gate_init))
+        self.gate = nn.Parameter(gate_value)
         self.reset_parameters()
 
     # TEST TIME EAGLE EXP: small adapter init avoids a sudden logit geometry jump.
@@ -192,14 +203,26 @@ class GatedResidualHiddenAdapter(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    # TEST TIME EAGLE EXP: residual correction, not replacement.
+    # TEST TIME EAGLE EXP: expose the effective gate value for residual or mixture use.
+    def gate_value(self) -> Tensor:
+        if self.merge_type == "interpolate":
+            return torch.sigmoid(self.gate)
+        return torch.tanh(self.gate)
+
+    # TEST TIME EAGLE EXP: gated residual or gated interpolation, never hard
+    # replacement unless the learned gate moves there.
     def forward(self, hidden_states: Tensor) -> Tensor:
+        original_dtype = hidden_states.dtype
         adapter_dtype = self.input_norm.weight.dtype
         normalized = self.input_norm(hidden_states.to(adapter_dtype))
-        delta = self.adapter(normalized)
-        gate = torch.tanh(self.gate).view(*((1,) * (hidden_states.dim() - 1)), -1)
-        corrected = hidden_states.to(adapter_dtype) + gate * delta
-        return corrected.to(hidden_states.dtype)
+        adapted = self.adapter(normalized)
+        gate = self.gate_value().view(*((1,) * (hidden_states.dim() - 1)), -1)
+        hidden_states = hidden_states.to(adapter_dtype)
+        if self.merge_type == "interpolate":
+            corrected = (1 - gate) * hidden_states + gate * adapted
+        else:
+            corrected = hidden_states + gate * adapted
+        return corrected.to(original_dtype)
 
     # TEST TIME EAGLE EXP: checkpoint metadata for loading the adapter later.
     def config_dict(self) -> Dict[str, object]:
@@ -209,11 +232,12 @@ class GatedResidualHiddenAdapter(nn.Module):
             "gate_type": self.gate_type,
             "gate_init": self.gate_init,
             "dropout": self.dropout,
+            "merge_type": self.merge_type,
         }
 
     # TEST TIME EAGLE EXP: scalar metric for checking whether the adapter moved.
     def gate_abs_mean(self) -> Tensor:
-        return torch.tanh(self.gate.detach()).abs().mean()
+        return self.gate_value().detach().abs().mean()
 
 
 # TEST TIME EAGLE EXP: inference wrapper applies the hidden adapter only at the
@@ -224,10 +248,14 @@ class HiddenAdapterDraftWrapper(nn.Module):
         *,
         draft_model: nn.Module,
         hidden_adapter: GatedResidualHiddenAdapter,
+        adapter_placement: str = "head",
     ) -> None:
         super().__init__()
+        if adapter_placement not in {"head", "state", "both"}:
+            raise ValueError("adapter_placement must be one of {'head', 'state', 'both'}")
         self.draft_model = draft_model
         self.hidden_adapter = hidden_adapter
+        self.adapter_placement = adapter_placement
 
     @property
     def config(self):
@@ -261,10 +289,26 @@ class HiddenAdapterDraftWrapper(nn.Module):
     def backbone(self, *args, **kwargs) -> Tensor:
         return self.draft_model.backbone(*args, **kwargs)
 
-    # TEST TIME EAGLE EXP: this is the only inference behavior change.
+    # TEST TIME EAGLE EXP: head-side inference changes logits; state-side inference
+    # keeps current logits raw and must call adapt_next_hidden for the next state.
     def compute_logits(self, hidden_states: Tensor) -> Tensor:
-        corrected_hidden = self.hidden_adapter(hidden_states)
-        return self.draft_model.compute_logits(corrected_hidden)
+        if self.adapter_placement in {"head", "both"}:
+            hidden_states = self.hidden_adapter(hidden_states)
+        return self.draft_model.compute_logits(hidden_states)
+
+    # TEST TIME EAGLE EXP: state-side inference correction for the next draft step.
+    def adapt_next_hidden(self, hidden_states: Tensor) -> Tensor:
+        if self.adapter_placement in {"state", "both"}:
+            return self.hidden_adapter(hidden_states)
+        return hidden_states
+
+    # TEST TIME EAGLE EXP: one-step helper for callers that need raw logits plus
+    # corrected next hidden state in the same draft step.
+    def step(self, *args, **kwargs) -> Tuple[Tensor, Tensor]:
+        raw_hidden = self.backbone(*args, **kwargs)
+        logits = self.compute_logits(raw_hidden)
+        next_hidden = self.adapt_next_hidden(raw_hidden)
+        return logits, next_hidden
 
 
 # TEST TIME EAGLE EXP: online trainer for FC-only hidden correction on top of a
@@ -272,10 +316,9 @@ class HiddenAdapterDraftWrapper(nn.Module):
 class OnlineEagle3HiddenAdapterModel(nn.Module):
     """Train a gated residual hidden adapter without modifying EAGLE3 weights.
 
-    Default behavior is LM-head-side correction only: the corrected hidden state
-    is used for logits/loss, while the next TTT step receives the original draft
-    hidden state. Set ``feed_corrected_hidden=True`` for the riskier truncated
-    backprop experiment where corrected states are fed forward inside the window.
+    ``adapter_placement='head'`` uses corrected hidden states only for logits.
+    ``adapter_placement='state'`` keeps current logits on raw draft hidden states
+    and feeds corrected hidden states into later draft steps. ``'both'`` does both.
     """
 
     def __init__(
@@ -289,6 +332,7 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
         hidden_weight: float = 0.2,
         hidden_loss_type: str = "mse",
         feed_corrected_hidden: bool = False,
+        adapter_placement: str = "head",
     ) -> None:
         super().__init__()
         if length < 1:
@@ -297,6 +341,10 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
             raise ValueError("Hidden adapter experiment does not support USP yet")
         if kl_weight < 0 or hidden_weight < 0:
             raise ValueError("kl_weight and hidden_weight must be non-negative")
+        if feed_corrected_hidden and adapter_placement == "head":
+            adapter_placement = "both"
+        if adapter_placement not in {"head", "state", "both"}:
+            raise ValueError("adapter_placement must be one of {'head', 'state', 'both'}")
         self.draft_model = draft_model
         self.hidden_adapter = hidden_adapter
         self.length = length
@@ -305,6 +353,7 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
         self.hidden_weight = hidden_weight
         self.hidden_loss_type = hidden_loss_type
         self.feed_corrected_hidden = feed_corrected_hidden
+        self.adapter_placement = adapter_placement
 
         for param in self.draft_model.parameters():
             param.requires_grad = False
@@ -349,6 +398,11 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
         if hasattr(hidden_adapter, "module"):
             hidden_adapter = hidden_adapter.module
         return hidden_adapter.gate_abs_mean()
+
+    # TEST TIME EAGLE EXP: state-side correction needs gradients through frozen
+    # draft operations with respect to the previous corrected hidden state.
+    def _needs_state_grad(self) -> bool:
+        return self.adapter_placement in {"state", "both"}
 
     # TEST TIME EAGLE EXP: draft-vocab KL and hidden-supervision slices share the
     # same TTT window offsets as original EAGLE.
@@ -431,7 +485,7 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
             inputs_embeds = self.draft_model.embed_input_ids(global_input_ids)
             inputs_embeds = inputs_embeds.to(draft_hidden_states.dtype)
 
-            if self.feed_corrected_hidden:
+            if self._needs_state_grad():
                 step_hidden_states = self.draft_model.backbone(
                     input_embeds=inputs_embeds,
                     hidden_states=draft_hidden_states,
@@ -441,7 +495,6 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                adapter_input = step_hidden_states
             else:
                 with torch.no_grad():
                     step_hidden_states = self.draft_model.backbone(
@@ -453,10 +506,27 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                adapter_input = step_hidden_states.detach()
 
+            adapter_input = (
+                step_hidden_states
+                if self._needs_state_grad()
+                else step_hidden_states.detach()
+            )
             corrected_hidden = self.hidden_adapter(adapter_input)
-            logits = self.draft_model.compute_logits(corrected_hidden)
+            if self.adapter_placement == "state":
+                logits_hidden = step_hidden_states
+                next_hidden_states = corrected_hidden
+            elif self.adapter_placement == "head":
+                logits_hidden = corrected_hidden
+                next_hidden_states = step_hidden_states.detach()
+            elif self.adapter_placement == "both":
+                logits_hidden = corrected_hidden
+                next_hidden_states = corrected_hidden
+            else:
+                raise ValueError(
+                    "adapter_placement must be one of {'head', 'state', 'both'}"
+                )
+            logits = self.draft_model.compute_logits(logits_hidden)
 
             kl_loss = _masked_kl_loss(
                 logits=logits,
@@ -490,10 +560,7 @@ class OnlineEagle3HiddenAdapterModel(nn.Module):
                 )
             )
 
-            if self.feed_corrected_hidden:
-                draft_hidden_states = corrected_hidden
-            else:
-                draft_hidden_states = step_hidden_states.detach()
+            draft_hidden_states = next_hidden_states
 
             if idx != self.length - 1:
                 global_input_ids = _padding(global_input_ids, left=False)

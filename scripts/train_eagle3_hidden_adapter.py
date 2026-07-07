@@ -2,8 +2,9 @@
 """Train the TEST TIME EAGLE EXP hidden adapter.
 
 TEST TIME EAGLE EXP: this script freezes an already-trained EAGLE3 draft model
-and trains only a gated residual hidden adapter before the draft LM head. The
-original EAGLE3 training script and checkpoint format are not modified.
+and trains only a gated hidden adapter either before the draft LM head or before
+the next draft hidden state. The original EAGLE3 training script and checkpoint
+format are not modified.
 """
 
 import argparse
@@ -74,8 +75,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["scalar", "channel"],
         default="scalar",
     )
-    group.add_argument("--hidden-adapter-gate-init", type=float, default=0.0)
+    group.add_argument(
+        "--hidden-adapter-merge-type",
+        choices=["residual", "interpolate"],
+        default="interpolate",
+        help=(
+            "residual: h + gate * FC(LN(h)); "
+            "interpolate: (1-gate) * h + gate * FC(LN(h))."
+        ),
+    )
+    group.add_argument("--hidden-adapter-gate-init", type=float, default=0.001)
     group.add_argument("--hidden-adapter-dropout", type=float, default=0.0)
+    group.add_argument(
+        "--hidden-adapter-placement",
+        choices=["head", "state", "both"],
+        default="state",
+        help=(
+            "head adapts current LM-head hidden; state keeps current LM-head raw "
+            "and adapts only the hidden passed to later draft steps; both does both."
+        ),
+    )
     group.add_argument("--hidden-kl-weight", type=float, default=0.8)
     group.add_argument("--hidden-mse-weight", type=float, default=0.2)
     group.add_argument(
@@ -87,10 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--feed-corrected-hidden",
         action="store_true",
-        help=(
-            "Use corrected hidden states as the next TTT state inside the window. "
-            "Default is safer LM-head-side correction only."
-        ),
+        help="Backward-compatible alias for --hidden-adapter-placement both.",
     )
     return parser
 
@@ -109,6 +125,8 @@ def validate_args(args: Namespace) -> None:
         raise ValueError("Hidden-adapter training does not support USP yet.")
     if args.hidden_kl_weight < 0 or args.hidden_mse_weight < 0:
         raise ValueError("Loss weights must be non-negative.")
+    if args.feed_corrected_hidden:
+        args.hidden_adapter_placement = "both"
 
 
 # TEST TIME EAGLE EXP: DDP wraps only the adapter, not the frozen EAGLE draft.
@@ -250,6 +268,7 @@ def main() -> None:
         gate_type=args.hidden_adapter_gate_type,
         gate_init=args.hidden_adapter_gate_init,
         dropout=args.hidden_adapter_dropout,
+        merge_type=args.hidden_adapter_merge_type,
     ).cuda()
     hidden_adapter_model = OnlineEagle3HiddenAdapterModel(
         draft_model=draft_model,
@@ -260,6 +279,7 @@ def main() -> None:
         hidden_weight=args.hidden_mse_weight,
         hidden_loss_type=args.hidden_loss_type,
         feed_corrected_hidden=args.feed_corrected_hidden,
+        adapter_placement=args.hidden_adapter_placement,
     ).cuda()
     hidden_adapter_model.hidden_adapter = maybe_wrap_ddp(
         hidden_adapter_model.hidden_adapter
@@ -283,6 +303,8 @@ def main() -> None:
         "Starting TEST TIME EAGLE EXP hidden-adapter training: "
         f"ttt_length={args.ttt_length}, kl_weight={args.hidden_kl_weight}, "
         f"hidden_weight={args.hidden_mse_weight}, "
+        f"placement={hidden_adapter_model.adapter_placement}, "
+        f"merge_type={args.hidden_adapter_merge_type}, "
         f"feed_corrected_hidden={args.feed_corrected_hidden}"
     )
 
